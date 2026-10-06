@@ -138,6 +138,7 @@ def main() -> int:
     all_axes = []
     all_stats = []
     all_span_candidates = []
+    all_direction_rays = []
 
     for source in sources:
         print(f"\nVectorising {source.source_id} / class {source.las_class}...")
@@ -149,7 +150,7 @@ def main() -> int:
         print(f"  loaded wire points: {len(xyz):,}")
 
         if not structures.empty:
-            spans = build_span_candidates(
+            spans, direction_rays = build_span_candidates(
                 structures,
                 xyz,
                 crs,
@@ -170,6 +171,12 @@ def main() -> int:
                 spans["SOURCE_ID"] = source.source_id
                 spans["LAS_CLASS"] = int(source.las_class)
                 all_span_candidates.append(spans)
+
+            if not direction_rays.empty:
+                direction_rays = direction_rays.copy()
+                direction_rays["SOURCE_ID"] = source.source_id
+                direction_rays["LAS_CLASS"] = int(source.las_class)
+                all_direction_rays.append(direction_rays)
 
             wires, axes, stats = vectorise_source_by_spans(
                 xyz,
@@ -253,6 +260,19 @@ def main() -> int:
             engine="pyogrio",
         )
 
+    if all_direction_rays:
+        direction_rays = gpd.GeoDataFrame(
+            pd.concat(all_direction_rays, ignore_index=True),
+            geometry="geometry",
+            crs=crs,
+        )
+        direction_rays.to_file(
+            gpkg,
+            layer="structure_directions",
+            driver="GPKG",
+            engine="pyogrio",
+        )
+
     print("\nWritten:")
     print(f"  {gpkg}")
     print(f"  {output / 'dataset_manifest.json'}")
@@ -262,6 +282,8 @@ def main() -> int:
         print("  GPKG layer: structures")
     if all_span_candidates:
         print("  GPKG layer: span_candidates")
+    if all_direction_rays:
+        print("  GPKG layer: structure_directions")
 
     print(
         f"\nFinal wires: "
