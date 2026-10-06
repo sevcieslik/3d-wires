@@ -1,6 +1,7 @@
 numpy
 pandas
-laspy[lazrs]
+laspy>=2.6.1
+lazrs>=0.8.2
 geopandas
 shapely
 pyproj
