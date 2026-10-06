@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import argparse
 import math
+import re
 import tempfile
 import zipfile
 import xml.etree.ElementTree as ET
@@ -11,6 +12,7 @@ from pathlib import Path
 import geopandas as gpd
 import laspy
 import numpy as np
+import pandas as pd
 from pyproj import CRS
 from scipy.spatial import cKDTree
 from shapely.geometry import LineString, MultiLineString, Point
@@ -256,6 +258,35 @@ def cluster_lidar_structures(xyz, crs, unit_to_m, eps_m, min_points):
     print(f"  LiDAR structure clusters: {len(result):,}")
     return result
 
+def parse_structure_series(value: str) -> tuple[str, int | None]:
+    """
+    Split a structure identifier into a branch/series and terminal ordinal.
+
+    Examples:
+      13~136  -> ("13", 136)
+      13A~7   -> ("13A", 7)
+      136     -> ("DEFAULT", 136)
+      P12     -> ("P", 12)
+
+    The series is used only to prevent unrelated branches within the same
+    LINE_NO from being interleaved by reference-line stationing.
+    """
+    raw = str(value or "").strip()
+    if not raw:
+        return "UNKNOWN", None
+
+    parts = [part.strip() for part in raw.split("~") if part.strip()]
+    if len(parts) >= 2 and re.fullmatch(r"\d+", parts[-1]):
+        return "~".join(parts[:-1]), int(parts[-1])
+
+    match = re.fullmatch(r"(.*?)(\d+)", raw)
+    if match:
+        prefix = match.group(1).rstrip("~-_ ").strip()
+        return (prefix or "DEFAULT"), int(match.group(2))
+
+    return raw, None
+
+
 def match_structures(client, lidar, unit_to_m, max_distance_m):
     if client.empty or lidar.empty:
         return gpd.GeoDataFrame(geometry=[], crs=lidar.crs)
@@ -274,10 +305,18 @@ def match_structures(client, lidar, unit_to_m, max_distance_m):
             continue
         c = client.loc[client_idx]
         l = lidar.iloc[lidar_idx]
+        structure_no = str(c.get("STRUCTURE_", "")).strip()
+        if not structure_no:
+            gis_no = str(c.get("GIS_NO", "")).strip()
+            structure_no = gis_no.split("~", 1)[1] if "~" in gis_no else gis_no
+        series, series_index = parse_structure_series(structure_no)
+
         rows.append({
             "LINE_NO": str(c.get("LINE_NO", "")),
             "GIS_NO": str(c.get("GIS_NO", "")),
-            "STRUCTURE_NO": str(c.get("STRUCTURE_", "")),
+            "STRUCTURE_NO": structure_no,
+            "STRUCTURE_SERIES": series,
+            "SERIES_INDEX": series_index,
             "CLIENT_GLOBALID": str(c.get("GLOBALID", "")),
             "LIDAR_STRUCTURE_ID": l["LIDAR_STRUCTURE_ID"],
             "MATCH_DIST_M": d_source * unit_to_m,
@@ -400,76 +439,221 @@ def wire_evidence(local, frame, unit_to_m, half_width_m, end_margin_m, bins):
         "MED_ABS_T_M": float(np.median(np.abs(t[ids])) * unit_to_m),
     }
 
-def build_reference_ordered_spans(matched, source_lines, wire_xyz, unit_to_m, corridor_halfwidth_m, end_margin_m, evidence_bins, min_wire_points, min_wire_coverage, min_longest_run, min_span_m, max_span_m):
+def build_reference_ordered_spans(
+    matched,
+    source_lines,
+    wire_xyz,
+    unit_to_m,
+    corridor_halfwidth_m,
+    end_margin_m,
+    evidence_bins,
+    min_wire_points,
+    min_wire_coverage,
+    min_longest_run,
+    min_span_m,
+    max_span_m,
+):
     line_map = merged_line_by_line_no(source_lines)
     wire_tree = cKDTree(wire_xyz[:, :2])
     accepted, rejected, reference_rows = [], [], []
+
     line_numbers = sorted(set(matched["LINE_NO"]) & set(line_map))
     print("\nBuilding ordered topology:")
-    print(f"  LINE_NO values with matched structures + source line: {len(line_numbers):,}")
+    print(
+        f"  LINE_NO values with matched structures + source line: "
+        f"{len(line_numbers):,}"
+    )
+
+    branch_count = 0
+
     for line_i, line_no in enumerate(line_numbers, start=1):
-        group = matched[matched["LINE_NO"] == line_no].copy()
-        if len(group) < 2:
+        line_group = matched[matched["LINE_NO"] == line_no].copy()
+        if len(line_group) < 2:
             continue
-        points_xy = np.column_stack((group["X"], group["Y"]))
-        ref_line = best_linestring_for_points(line_map[line_no], points_xy)
+
+        all_points_xy = np.column_stack((line_group["X"], line_group["Y"]))
+        ref_line = best_linestring_for_points(
+            line_map[line_no],
+            all_points_xy,
+        )
         if ref_line is None:
             continue
-        reference_rows.append({"LINE_NO": line_no, "geometry": ref_line})
-        group["_station"] = [float(ref_line.project(Point(float(x), float(y)))) for x, y in points_xy]
-        group = group.sort_values("_station").reset_index(drop=True)
+
+        reference_rows.append({
+            "LINE_NO": line_no,
+            "geometry": ref_line,
+        })
+
+        line_group["_station"] = [
+            float(ref_line.project(Point(float(x), float(y))))
+            for x, y in all_points_xy
+        ]
+
+        # Critical topology rule:
+        # LINE_NO can contain parallel/branch structure sequences such as
+        # 13~136...140 and 13A~1...10. Do not interleave them by station.
+        series_groups = []
+        for series, branch in line_group.groupby(
+            "STRUCTURE_SERIES",
+            dropna=False,
+        ):
+            branch = branch.copy()
+            if len(branch) < 2:
+                continue
+
+            # Station is the primary order because client numbering can have gaps.
+            # SERIES_INDEX is a stable tie-breaker only.
+            branch["_series_sort"] = pd.to_numeric(
+                branch["SERIES_INDEX"],
+                errors="coerce",
+            )
+            branch = branch.sort_values(
+                ["_station", "_series_sort"],
+                na_position="last",
+            ).reset_index(drop=True)
+
+            series_groups.append((str(series), branch))
+
+        branch_count += len(series_groups)
+
         if line_i == 1 or line_i % 25 == 0 or line_i == len(line_numbers):
-            print(f"  line {line_i:,}/{len(line_numbers):,}: {line_no} | {len(group):,} matched structures")
-        for i in range(len(group) - 1):
-            a, b = group.iloc[i], group.iloc[i + 1]
-            a_xy = np.asarray([a["X"], a["Y"]], dtype=np.float64)
-            b_xy = np.asarray([b["X"], b["Y"]], dtype=np.float64)
-            frame = span_frame(a_xy, b_xy)
-            if frame is None:
-                continue
-            length_m = frame["length"] * unit_to_m
-            base = {
-                "LINE_NO": line_no,
-                "STRUCT_A": a["GIS_NO"], "STRUCT_B": b["GIS_NO"],
-                "LIDAR_A": a["LIDAR_STRUCTURE_ID"], "LIDAR_B": b["LIDAR_STRUCTURE_ID"],
-                "LENGTH_M": float(length_m),
-                "REF_STATION_A": float(a["_station"]), "REF_STATION_B": float(b["_station"]),
-                "MATCH_A_M": float(a["MATCH_DIST_M"]), "MATCH_B_M": float(b["MATCH_DIST_M"]),
-                "geometry": LineString([(float(a_xy[0]), float(a_xy[1])), (float(b_xy[0]), float(b_xy[1]))]),
-            }
-            if length_m < min_span_m:
-                rejected.append({**base, "REJECT_REASON": "TOO_SHORT"})
-                continue
-            if length_m > max_span_m:
-                rejected.append({**base, "REJECT_REASON": "TOO_LONG_OR_MISSING_INTERMEDIATE_STRUCTURE"})
-                continue
-            local = local_wire_subset(wire_xyz, wire_tree, frame, corridor_halfwidth_m / unit_to_m, end_margin_m / unit_to_m)
-            evidence = wire_evidence(local, frame, unit_to_m, corridor_halfwidth_m, end_margin_m, evidence_bins)
-            row = {**base, **evidence}
-            if evidence["WIRE_POINTS"] < min_wire_points:
-                row["REJECT_REASON"] = "INSUFFICIENT_WIRE_POINTS"; rejected.append(row); continue
-            if evidence["WIRE_COVERAGE"] < min_wire_coverage:
-                row["REJECT_REASON"] = "LOW_WIRE_COVERAGE"; rejected.append(row); continue
-            if evidence["LONGEST_RUN"] < min_longest_run:
-                row["REJECT_REASON"] = "WIRE_NOT_CONTINUOUS"; rejected.append(row); continue
-            if not evidence["START_OK"]:
-                row["REJECT_REASON"] = "NO_WIRE_NEAR_STRUCTURE_A"; rejected.append(row); continue
-            if not evidence["END_OK"]:
-                row["REJECT_REASON"] = "NO_WIRE_NEAR_STRUCTURE_B"; rejected.append(row); continue
-            row["SPAN_ID"] = f"SP{len(accepted) + 1:05d}"
-            row["TOPOLOGY_SOURCE"] = "CLIENT_ORDER_LIDAR_GEOMETRY_WIRE_CONFIRMED"
-            accepted.append(row)
+            branch_summary = ", ".join(
+                f"{series}:{len(branch)}"
+                for series, branch in series_groups
+            )
+            print(
+                f"  line {line_i:,}/{len(line_numbers):,}: "
+                f"{line_no} | {len(line_group):,} matched structures | "
+                f"series [{branch_summary}]"
+            )
+
+        for series, group in series_groups:
+            for i in range(len(group) - 1):
+                a = group.iloc[i]
+                b = group.iloc[i + 1]
+
+                a_xy = np.asarray([a["X"], a["Y"]], dtype=np.float64)
+                b_xy = np.asarray([b["X"], b["Y"]], dtype=np.float64)
+
+                frame = span_frame(a_xy, b_xy)
+                if frame is None:
+                    continue
+
+                length_m = frame["length"] * unit_to_m
+
+                base = {
+                    "LINE_NO": line_no,
+                    "STRUCTURE_SERIES": series,
+                    "SERIES_INDEX_A": a.get("SERIES_INDEX"),
+                    "SERIES_INDEX_B": b.get("SERIES_INDEX"),
+                    "STRUCT_A": a["GIS_NO"],
+                    "STRUCT_B": b["GIS_NO"],
+                    "LIDAR_A": a["LIDAR_STRUCTURE_ID"],
+                    "LIDAR_B": b["LIDAR_STRUCTURE_ID"],
+                    "LENGTH_M": float(length_m),
+                    "REF_STATION_A": float(a["_station"]),
+                    "REF_STATION_B": float(b["_station"]),
+                    "MATCH_A_M": float(a["MATCH_DIST_M"]),
+                    "MATCH_B_M": float(b["MATCH_DIST_M"]),
+                    "geometry": LineString([
+                        (float(a_xy[0]), float(a_xy[1])),
+                        (float(b_xy[0]), float(b_xy[1])),
+                    ]),
+                }
+
+                if length_m < min_span_m:
+                    rejected.append({
+                        **base,
+                        "REJECT_REASON": "TOO_SHORT",
+                    })
+                    continue
+
+                if length_m > max_span_m:
+                    rejected.append({
+                        **base,
+                        "REJECT_REASON":
+                            "TOO_LONG_OR_MISSING_INTERMEDIATE_STRUCTURE",
+                    })
+                    continue
+
+                local = local_wire_subset(
+                    wire_xyz,
+                    wire_tree,
+                    frame,
+                    corridor_halfwidth_m / unit_to_m,
+                    end_margin_m / unit_to_m,
+                )
+
+                evidence = wire_evidence(
+                    local,
+                    frame,
+                    unit_to_m,
+                    corridor_halfwidth_m,
+                    end_margin_m,
+                    evidence_bins,
+                )
+
+                row = {**base, **evidence}
+
+                if evidence["WIRE_POINTS"] < min_wire_points:
+                    row["REJECT_REASON"] = "INSUFFICIENT_WIRE_POINTS"
+                    rejected.append(row)
+                    continue
+
+                if evidence["WIRE_COVERAGE"] < min_wire_coverage:
+                    row["REJECT_REASON"] = "LOW_WIRE_COVERAGE"
+                    rejected.append(row)
+                    continue
+
+                if evidence["LONGEST_RUN"] < min_longest_run:
+                    row["REJECT_REASON"] = "WIRE_NOT_CONTINUOUS"
+                    rejected.append(row)
+                    continue
+
+                if not evidence["START_OK"]:
+                    row["REJECT_REASON"] = "NO_WIRE_NEAR_STRUCTURE_A"
+                    rejected.append(row)
+                    continue
+
+                if not evidence["END_OK"]:
+                    row["REJECT_REASON"] = "NO_WIRE_NEAR_STRUCTURE_B"
+                    rejected.append(row)
+                    continue
+
+                row["SPAN_ID"] = f"SP{len(accepted) + 1:05d}"
+                row["TOPOLOGY_SOURCE"] = (
+                    "CLIENT_LINE_SERIES_ORDER_"
+                    "LIDAR_GEOMETRY_WIRE_CONFIRMED"
+                )
+                accepted.append(row)
+
     crs = matched.crs
-    accepted_gdf = gpd.GeoDataFrame(accepted, geometry="geometry", crs=crs)
-    rejected_gdf = gpd.GeoDataFrame(rejected, geometry="geometry", crs=crs)
-    reference_gdf = gpd.GeoDataFrame(reference_rows, geometry="geometry", crs=crs)
+    accepted_gdf = gpd.GeoDataFrame(
+        accepted,
+        geometry="geometry",
+        crs=crs,
+    )
+    rejected_gdf = gpd.GeoDataFrame(
+        rejected,
+        geometry="geometry",
+        crs=crs,
+    )
+    reference_gdf = gpd.GeoDataFrame(
+        reference_rows,
+        geometry="geometry",
+        crs=crs,
+    )
+
+    print(f"  structure series processed: {branch_count:,}")
     print("\nTopology result:")
     print(f"  accepted spans: {len(accepted_gdf):,}")
     print(f"  rejected spans: {len(rejected_gdf):,}")
+
     if not rejected_gdf.empty:
         print("\nReject reasons:")
         for reason, count in rejected_gdf["REJECT_REASON"].value_counts().items():
             print(f"  {reason}: {count:,}")
+
     return accepted_gdf, rejected_gdf, reference_gdf
 
 def build_parser():
