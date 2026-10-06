@@ -55,7 +55,7 @@ def cluster_structures(
     labels = DBSCAN(
         eps=eps_source,
         min_samples=min_points,
-        n_jobs=1,
+        n_jobs=-1,
     ).fit_predict(xyz[:, :2])
 
     rows = []
@@ -102,6 +102,28 @@ def _project_to_span(xyz: np.ndarray, frame: dict) -> tuple[np.ndarray, np.ndarr
     return centered @ frame["u"], centered @ frame["p"]
 
 
+def _local_wire_subset(
+    wire_xyz: np.ndarray,
+    wire_tree: cKDTree,
+    frame: dict,
+    half_width_source: float,
+    end_margin_source: float,
+) -> np.ndarray:
+    """
+    Conservative circular pre-filter around a span.
+
+    This avoids projecting the complete conductor class for every candidate span.
+    The returned points still go through the exact rectangular span test later.
+    """
+    midpoint = frame["origin"] + 0.5 * frame["length"] * frame["u"]
+    along = 0.5 * frame["length"] + end_margin_source
+    radius = math.hypot(along, half_width_source)
+    ids = wire_tree.query_ball_point(midpoint, r=radius)
+    if not ids:
+        return np.empty((0, 3), dtype=np.float64)
+    return wire_xyz[np.asarray(ids, dtype=np.int64)]
+
+
 def _has_intermediate_structure(
     a_idx: int,
     b_idx: int,
@@ -124,16 +146,25 @@ def _has_intermediate_structure(
 
 
 def _wire_evidence(
-    wire_xyz: np.ndarray,
+    local_wire_xyz: np.ndarray,
     frame: dict,
     unit_to_m: float,
     corridor_halfwidth_m: float,
     end_margin_m: float,
     bins: int,
 ) -> dict:
+    if len(local_wire_xyz) == 0:
+        return {
+            "points": 0,
+            "coverage": 0.0,
+            "longest_run": 0.0,
+            "median_abs_t_m": float("inf"),
+        }
+
     half = corridor_halfwidth_m / max(unit_to_m, 1e-12)
     end = end_margin_m / max(unit_to_m, 1e-12)
-    s, t = _project_to_span(wire_xyz, frame)
+    s, t = _project_to_span(local_wire_xyz, frame)
+
     mask = (
         (s >= -end)
         & (s <= frame["length"] + end)
@@ -142,7 +173,6 @@ def _wire_evidence(
     ids = np.flatnonzero(mask)
     if len(ids) == 0:
         return {
-            "ids": ids,
             "points": 0,
             "coverage": 0.0,
             "longest_run": 0.0,
@@ -151,14 +181,17 @@ def _wire_evidence(
 
     inside_s = s[ids]
     valid = (inside_s >= 0.0) & (inside_s <= frame["length"])
+
+    occupied = np.zeros(bins, dtype=bool)
     if np.any(valid):
         bin_index = np.floor(
-            np.clip(inside_s[valid] / max(frame["length"], 1e-9), 0, 0.999999) * bins
+            np.clip(
+                inside_s[valid] / max(frame["length"], 1e-9),
+                0,
+                0.999999,
+            ) * bins
         ).astype(int)
-        occupied = np.zeros(bins, dtype=bool)
         occupied[np.unique(bin_index)] = True
-    else:
-        occupied = np.zeros(bins, dtype=bool)
 
     longest = 0
     current = 0
@@ -170,7 +203,6 @@ def _wire_evidence(
             current = 0
 
     return {
-        "ids": ids,
         "points": int(len(ids)),
         "coverage": float(occupied.mean()) if bins else 0.0,
         "longest_run": float(longest / max(bins, 1)),
@@ -196,40 +228,64 @@ def build_span_candidates(
     if structures.empty or len(structures) < 2 or len(wire_xyz) == 0:
         return gpd.GeoDataFrame(geometry=[], crs=crs)
 
-    xy = np.column_stack((structures["X"].to_numpy(), structures["Y"].to_numpy()))
+    structure_xy = np.column_stack(
+        (structures["X"].to_numpy(), structures["Y"].to_numpy())
+    )
+
     max_source = max_span_m / max(unit_to_m, 1e-12)
     min_source = min_span_m / max(unit_to_m, 1e-12)
     intermediate_tol = structure_on_line_tol_m / max(unit_to_m, 1e-12)
+    half_source = corridor_halfwidth_m / max(unit_to_m, 1e-12)
+    end_source = end_margin_m / max(unit_to_m, 1e-12)
 
-    tree = cKDTree(xy)
-    pairs = sorted(tree.query_pairs(r=max_source))
+    structure_tree = cKDTree(structure_xy)
+    wire_tree = cKDTree(wire_xyz[:, :2])
+
+    pairs = sorted(structure_tree.query_pairs(r=max_source))
+    print(f"  candidate structure pairs before wire evidence: {len(pairs):,}")
+
     rows = []
     span_number = 1
 
-    for a_idx, b_idx in pairs:
-        frame = _span_frame(xy[a_idx], xy[b_idx])
+    for pair_no, (a_idx, b_idx) in enumerate(pairs, start=1):
+        if pair_no % 1000 == 0:
+            print(
+                f"    span evidence: {pair_no:,}/{len(pairs):,} pairs checked, "
+                f"{len(rows):,} accepted"
+            )
+
+        frame = _span_frame(structure_xy[a_idx], structure_xy[b_idx])
         if frame is None or frame["length"] < min_source:
             continue
 
-        # Adjacent supports only. If another clustered structure sits between
-        # the pair close to the candidate line, this is a skip-span and is rejected.
         if _has_intermediate_structure(
             a_idx,
             b_idx,
-            xy,
+            structure_xy,
             frame,
             intermediate_tol,
         ):
             continue
 
-        evidence = _wire_evidence(
+        local_wire_xyz = _local_wire_subset(
             wire_xyz,
+            wire_tree,
+            frame,
+            half_source,
+            end_source,
+        )
+        if len(local_wire_xyz) < min_wire_points:
+            continue
+
+        evidence = _wire_evidence(
+            local_wire_xyz,
             frame,
             unit_to_m,
             corridor_halfwidth_m,
             end_margin_m,
             evidence_bins,
         )
+
         if evidence["points"] < min_wire_points:
             continue
         if evidence["coverage"] < min_wire_coverage:
@@ -239,10 +295,14 @@ def build_span_candidates(
 
         a_id = str(structures.iloc[a_idx]["STRUCTURE_ID"])
         b_id = str(structures.iloc[b_idx]["STRUCTURE_ID"])
+
         score = (
             0.60 * evidence["coverage"]
             + 0.30 * evidence["longest_run"]
-            + 0.10 * min(1.0, evidence["points"] / max(min_wire_points * 5, 1))
+            + 0.10 * min(
+                1.0,
+                evidence["points"] / max(min_wire_points * 5, 1),
+            )
         )
 
         rows.append({
@@ -257,8 +317,14 @@ def build_span_candidates(
             "EVIDENCE_SCORE": float(score),
             "AXIS_SOURCE": "STRUCTURES_CONFIRMED_BY_WIRES",
             "geometry": LineString([
-                (float(xy[a_idx, 0]), float(xy[a_idx, 1])),
-                (float(xy[b_idx, 0]), float(xy[b_idx, 1])),
+                (
+                    float(structure_xy[a_idx, 0]),
+                    float(structure_xy[a_idx, 1]),
+                ),
+                (
+                    float(structure_xy[b_idx, 0]),
+                    float(structure_xy[b_idx, 1]),
+                ),
             ]),
         })
         span_number += 1
@@ -277,7 +343,11 @@ def _axis_from_span_geometry(span_geom: LineString, xyz: np.ndarray) -> dict:
     return frame
 
 
-def _track_geometry_to_supports(track: dict, axis: dict, min_sections: int):
+def _track_geometry_to_supports(
+    track: dict,
+    axis: dict,
+    min_sections: int,
+):
     obs = sorted(track["obs"], key=lambda row: row["s"])
     if len(obs) < min_sections:
         return None, {}
@@ -285,6 +355,7 @@ def _track_geometry_to_supports(track: dict, axis: dict, min_sections: int):
     s = np.asarray([row["s"] for row in obs], dtype=np.float64)
     t = np.asarray([row["t"] for row in obs], dtype=np.float64)
     z = np.asarray([row["z"] for row in obs], dtype=np.float64)
+
     if np.ptp(s) <= 1e-9:
         return None, {}
 
@@ -292,8 +363,6 @@ def _track_geometry_to_supports(track: dict, axis: dict, min_sections: int):
     z_degree = 2 if len(obs) >= 3 else 1
     z_coef = np.polyfit(s, z, z_degree)
 
-    # Structures define the physical span extent. The conductor fit is
-    # extrapolated only to the two support axes, never beyond them.
     n = max(12, min(240, len(obs) * 4))
     sample_s = np.linspace(0.0, float(axis["length"]), n)
     sample_t = np.polyval(t_coef, sample_s)
@@ -304,13 +373,19 @@ def _track_geometry_to_supports(track: dict, axis: dict, min_sections: int):
         + sample_s[:, None] * axis["u"][None, :]
         + sample_t[:, None] * axis["p"][None, :]
     )
+
     geom = LineString([
         (float(x), float(y), float(zz))
         for (x, y), zz in zip(xy, sample_z)
     ])
 
-    t_rmse = float(np.sqrt(np.mean((t - np.polyval(t_coef, s)) ** 2)))
-    z_rmse = float(np.sqrt(np.mean((z - np.polyval(z_coef, s)) ** 2)))
+    t_rmse = float(
+        np.sqrt(np.mean((t - np.polyval(t_coef, s)) ** 2))
+    )
+    z_rmse = float(
+        np.sqrt(np.mean((z - np.polyval(z_coef, s)) ** 2))
+    )
+
     section_ids = [int(row["section"]) for row in obs]
     extent = int(max(section_ids) - min(section_ids) + 1)
     coverage = len(set(section_ids)) / max(extent, 1)
@@ -358,20 +433,44 @@ def vectorise_source_by_spans(
     max_t_source = max_t_jump_m / max(unit_to_m, 1e-12)
     max_z_source = max_z_jump_m / max(unit_to_m, 1e-12)
 
-    for span in spans.itertuples():
-        base = _axis_from_span_geometry(span.geometry, wire_xyz)
-        s = base["s"]
-        t = base["t"]
+    wire_tree = cKDTree(wire_xyz[:, :2])
+
+    total_spans = len(spans)
+    for span_no, span in enumerate(spans.itertuples(), start=1):
+        if span_no % 250 == 0:
+            print(
+                f"    vectorisation: {span_no:,}/{total_spans:,} spans processed, "
+                f"{len(wire_rows):,} wire tracks built"
+            )
+
+        coords = list(span.geometry.coords)
+        a = np.asarray(coords[0][:2], dtype=np.float64)
+        b = np.asarray(coords[-1][:2], dtype=np.float64)
+        base = _span_frame(a, b)
+        if base is None:
+            continue
+
+        local_wire_xyz = _local_wire_subset(
+            wire_xyz,
+            wire_tree,
+            base,
+            half,
+            end,
+        )
+        if len(local_wire_xyz) == 0:
+            continue
+
+        s, t = _project_to_span(local_wire_xyz, base)
         mask = (
             (s >= -end)
             & (s <= base["length"] + end)
             & (np.abs(t) <= half)
         )
-        ids = np.flatnonzero(mask)
-        if len(ids) == 0:
+
+        xyz = local_wire_xyz[mask]
+        if len(xyz) == 0:
             continue
 
-        xyz = wire_xyz[ids]
         axis = _axis_from_span_geometry(span.geometry, xyz)
 
         sections = _section_observations(
@@ -381,6 +480,7 @@ def vectorise_source_by_spans(
             cross_eps_source,
             min_cluster_points,
         )
+
         tracks = _link_tracks(
             sections,
             max_t_source,
@@ -388,6 +488,7 @@ def vectorise_source_by_spans(
         )
 
         accepted = 0
+
         for track in tracks:
             geom, metrics = _track_geometry_to_supports(
                 track,
@@ -397,7 +498,11 @@ def vectorise_source_by_spans(
             if geom is None:
                 continue
 
-            rmse_m = max(metrics["t_rmse"], metrics["z_rmse"]) * unit_to_m
+            rmse_m = max(
+                metrics["t_rmse"],
+                metrics["z_rmse"],
+            ) * unit_to_m
+
             if metrics["coverage"] >= 0.55 and rmse_m <= 1.5:
                 status = "FINAL"
                 confidence = (
@@ -430,6 +535,7 @@ def vectorise_source_by_spans(
                 "LENGTH_M": float(geom.length) * unit_to_m,
                 "geometry": geom,
             })
+
             wire_number += 1
             accepted += 1
 
