@@ -140,6 +140,19 @@ def read_source_data(source: Path, target_crs: CRS):
     for fld in ("LINE_NO", "GIS_NO"):
         if fld not in structures.columns:
             raise RuntimeError(f"Source structures missing required field: {fld}")
+    # Remove source records that cannot participate in spatial matching.
+    # The supplied NMIP26068 structure layer contains at least one NULL geometry.
+    bad_lines = lines.geometry.isna() | lines.geometry.is_empty
+    bad_structures = structures.geometry.isna() | structures.geometry.is_empty
+
+    if bad_lines.any():
+        print(f"  source lines with null/empty geometry skipped: {int(bad_lines.sum()):,}")
+        lines = lines.loc[~bad_lines].copy()
+
+    if bad_structures.any():
+        print(f"  source structures with null/empty geometry skipped: {int(bad_structures.sum()):,}")
+        structures = structures.loc[~bad_structures].copy()
+
     lines = lines.to_crs(target_crs)
     structures = structures.to_crs(target_crs)
     lines["LINE_NO"] = lines["LINE_NO"].astype(str).str.strip()
