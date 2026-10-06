@@ -266,10 +266,48 @@ def match_structures(client, lidar, unit_to_m, max_distance_m):
 
 def merged_line_by_line_no(lines):
     result = {}
+
     for line_no, group in lines.groupby("LINE_NO"):
-        geoms = [g for g in group.geometry if g is not None and not g.is_empty]
-        if geoms:
-            result[str(line_no)] = linemerge(unary_union(geoms))
+        geoms = [
+            g for g in group.geometry
+            if g is not None and not g.is_empty
+        ]
+        if not geoms:
+            continue
+
+        # Shapely 2.x linemerge expects a multi-line collection/sequence.
+        # unary_union may legitimately return a single LineString.
+        if len(geoms) == 1:
+            merged = geoms[0]
+        else:
+            unioned = unary_union(geoms)
+
+            if isinstance(unioned, LineString):
+                merged = unioned
+
+            elif isinstance(unioned, MultiLineString):
+                merged = linemerge(unioned)
+
+            else:
+                try:
+                    line_parts = [
+                        g for g in unioned.geoms
+                        if isinstance(g, LineString)
+                    ]
+                except Exception:
+                    line_parts = []
+
+                if not line_parts:
+                    continue
+
+                merged = (
+                    line_parts[0]
+                    if len(line_parts) == 1
+                    else linemerge(line_parts)
+                )
+
+        result[str(line_no)] = merged
+
     return result
 
 def best_linestring_for_points(reference_geom, points_xy):
@@ -413,7 +451,7 @@ def build_parser():
     p.add_argument("-o", "--output", default="01_reference_topology_output")
     p.add_argument("--wire-class", type=int, default=187)
     p.add_argument("--structure-class", type=int, default=215)
-    p.add_argument("--structure-cluster-eps-m", type=float, default=5.0)
+    p.add_argument("--structure-cluster-eps-m", type=float, default=1.5)
     p.add_argument("--structure-min-points", type=int, default=3)
     p.add_argument("--structure-match-m", type=float, default=35.0)
     p.add_argument("--span-corridor-halfwidth-m", type=float, default=18.0)
