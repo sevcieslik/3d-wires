@@ -105,6 +105,36 @@ def load_lidar_classes_one_pass(files: list[Path], wire_class: int, structure_cl
     print(f"  class {structure_class} structure points: {total_structure:,}")
     return wire_xyz, structure_xyz
 
+
+def load_or_cache_topology_classes(
+    files: list[Path],
+    wire_class: int,
+    structure_class: int,
+    cache_dir: Path,
+    rebuild: bool = False,
+):
+    cache_dir.mkdir(parents=True, exist_ok=True)
+    wire_cache = cache_dir / f"class_{wire_class}_xyz.npy"
+    structure_cache = cache_dir / f"class_{structure_class}_xyz.npy"
+
+    if not rebuild and wire_cache.exists() and structure_cache.exists():
+        print("\nLoading cached topology classes...")
+        wire_xyz = np.load(wire_cache, mmap_mode=None)
+        structure_xyz = np.load(structure_cache, mmap_mode=None)
+        print(f"  class {wire_class} wire points: {len(wire_xyz):,} [cache]")
+        print(f"  class {structure_class} structure points: {len(structure_xyz):,} [cache]")
+        return wire_xyz, structure_xyz
+
+    wire_xyz, structure_xyz = load_lidar_classes_one_pass(
+        files,
+        wire_class,
+        structure_class,
+    )
+    np.save(wire_cache, wire_xyz)
+    np.save(structure_cache, structure_xyz)
+    print(f"  cache written: {cache_dir}")
+    return wire_xyz, structure_xyz
+
 def locate_source_shapefiles(source: Path):
     temp = None
     if source.is_file() and source.suffix.lower() == ".zip":
@@ -462,6 +492,11 @@ def build_parser():
     p.add_argument("--span-min-longest-run", type=float, default=0.60)
     p.add_argument("--min-span-m", type=float, default=10.0)
     p.add_argument("--max-span-m", type=float, default=650.0)
+    p.add_argument(
+        "--rebuild-cache",
+        action="store_true",
+        help="Ignore cached class 187/215 arrays and reread all LAS/LAZ files.",
+    )
     return p
 
 def main():
@@ -479,7 +514,14 @@ def main():
     crs = resolve_lidar_crs(files, args.epsg)
     u2m = unit_to_metre(crs)
     print(f"CRS unit to metre factor: {u2m}")
-    wire_xyz, structure_xyz = load_lidar_classes_one_pass(files, args.wire_class, args.structure_class)
+    cache_dir = output / "_cache"
+    wire_xyz, structure_xyz = load_or_cache_topology_classes(
+        files,
+        args.wire_class,
+        args.structure_class,
+        cache_dir,
+        rebuild=args.rebuild_cache,
+    )
     if len(wire_xyz) == 0:
         raise RuntimeError(f"No points found in wire class {args.wire_class}.")
     if len(structure_xyz) == 0:
