@@ -1,0 +1,9 @@
+numpy
+pandas
+laspy[lazrs]
+geopandas
+shapely
+pyproj
+pyogrio
+scipy
+scikit-learn
