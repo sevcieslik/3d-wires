@@ -260,31 +260,60 @@ def cluster_lidar_structures(xyz, crs, unit_to_m, eps_m, min_points):
 
 def parse_structure_series(value: str) -> tuple[str, int | None]:
     """
-    Split a structure identifier into a branch/series and terminal ordinal.
+    Split a structure identifier into a sequence/branch and a numeric ordinal.
 
     Examples:
-      13~136  -> ("13", 136)
-      13A~7   -> ("13A", 7)
-      136     -> ("DEFAULT", 136)
-      P12     -> ("P", 12)
+      13~136   -> ("13", 136)
+      13A~7    -> ("13A", 7)
+      4~158A   -> ("4", 158)
+      4A~A1    -> ("4A~A", 1)
+      P12      -> ("P", 12)
 
-    The series is used only to prevent unrelated branches within the same
-    LINE_NO from being interleaved by reference-line stationing.
+    Trailing letters after the numeric ordinal (e.g. 158A) are treated as
+    structure suffixes, not as a separate branch. Leading letters before the
+    ordinal (e.g. A1) are treated as part of the branch.
     """
     raw = str(value or "").strip()
-    if not raw:
+    if not raw or raw.lower() in {"nan", "none"}:
         return "UNKNOWN", None
 
     parts = [part.strip() for part in raw.split("~") if part.strip()]
-    if len(parts) >= 2 and re.fullmatch(r"\d+", parts[-1]):
-        return "~".join(parts[:-1]), int(parts[-1])
 
-    match = re.fullmatch(r"(.*?)(\d+)", raw)
-    if match:
-        prefix = match.group(1).rstrip("~-_ ").strip()
-        return (prefix or "DEFAULT"), int(match.group(2))
+    if len(parts) >= 2:
+        tail = parts[-1]
+
+        # Numeric ordinal with optional trailing suffix: 158, 158A, 158AA.
+        m = re.fullmatch(r"(\d+)([A-Za-z]*)", tail)
+        if m:
+            return "~".join(parts[:-1]), int(m.group(1))
+
+        # Branch prefix inside the last token: A1, B12, etc.
+        m = re.fullmatch(r"([A-Za-z]+)(\d+)([A-Za-z]*)", tail)
+        if m:
+            series = "~".join(parts[:-1] + [m.group(1)])
+            return series, int(m.group(2))
+
+    # Single-token fallback: P12, 136A, etc.
+    m = re.fullmatch(r"([A-Za-z]*)(\d+)([A-Za-z]*)", raw)
+    if m:
+        prefix = m.group(1).strip()
+        return (prefix or "DEFAULT"), int(m.group(2))
 
     return raw, None
+
+
+def rows_to_gdf(rows, crs):
+    """
+    Build a GeoDataFrame safely even when rows is empty.
+    """
+    if rows:
+        return gpd.GeoDataFrame(rows, geometry="geometry", crs=crs)
+
+    return gpd.GeoDataFrame(
+        {"geometry": gpd.GeoSeries([], crs=crs)},
+        geometry="geometry",
+        crs=crs,
+    )
 
 
 def match_structures(client, lidar, unit_to_m, max_distance_m):
@@ -628,21 +657,9 @@ def build_reference_ordered_spans(
                 accepted.append(row)
 
     crs = matched.crs
-    accepted_gdf = gpd.GeoDataFrame(
-        accepted,
-        geometry="geometry",
-        crs=crs,
-    )
-    rejected_gdf = gpd.GeoDataFrame(
-        rejected,
-        geometry="geometry",
-        crs=crs,
-    )
-    reference_gdf = gpd.GeoDataFrame(
-        reference_rows,
-        geometry="geometry",
-        crs=crs,
-    )
+    accepted_gdf = rows_to_gdf(accepted, crs)
+    rejected_gdf = rows_to_gdf(rejected, crs)
+    reference_gdf = rows_to_gdf(reference_rows, crs)
 
     print(f"  structure series processed: {branch_count:,}")
     print("\nTopology result:")
