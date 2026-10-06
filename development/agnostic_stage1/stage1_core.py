@@ -628,7 +628,7 @@ def export_outputs(
 
     manifest = {
         "stage": "01_agnostic_conductor_extraction",
-        "version": "0.1-dev",
+        "version": "0.2-dev",
         "crs": info.crs,
         "crs_status": info.crs_status,
         "source_unit": info.source_unit,
